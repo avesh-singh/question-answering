@@ -5,8 +5,10 @@ from keras.preprocessing.text import Tokenizer
 import numpy as np
 from keras import layers, models
 
+import tensorflow as tf
+# print(tf.config.experimental.list_physical_devices('GPU'))
 
-directory = '../Datasets/tasks_1-20_v1-2/en-10k'
+directory = '../Datasets/tasks_1-20_v1-2/en'
 MAX_STORY_LENGTH = 100
 MAX_QUES_LENGTH = 100
 EMBEDDING_DIM = 100
@@ -15,13 +17,13 @@ RECURRENT_LAYER = layers.recurrent.LSTM
 STORY_HIDDEN = 32
 QUEST_HIDDEN = 32
 EPOCHS = 5
-TASK = 10
+TASK = 6
 
 
-def get_file_list(data_type: str):
+def get_file_list(data_type: str, direc=directory):
     filename = []
     pattern = re.compile(r"{}\.txt".format(data_type))
-    for _, _, files in os.walk(directory):
+    for _, _, files in os.walk(direc):
         filename = [file for file in files if re.search(pattern, file)]
         filename = sorted(filename, key=lambda f: int(re.match(r'qa(\d+).*', f).group(1)))
     return filename
@@ -31,7 +33,7 @@ def tokenize(sentence):
     return [word.strip() for word in re.split(r'(\W+)', sentence.lower()) if word.strip()]
 
 
-def structure_data(filename: str):
+def structure_data(filename: str, complete=True):
     contexts = []
     questions = []
     answers = []
@@ -59,6 +61,8 @@ def structure_data(filename: str):
                 answers.append(tokenize(found[2]))
                 support_lines = map(int, found[3].split())
                 supporting_facts.extend([scenario[l - 1] for l in support_lines])
+                if not complete:
+                    story = []
             else:
                 story.extend(tokenize(found[1]))
             scenario.append(tokenize(found[1]))
@@ -78,10 +82,9 @@ def one_hot_encoding(seq, vocab_size):
 def convert_data(story, question, answer, facts, only_supporting=False):
     stories = tokenizer.texts_to_sequences(story)
     questions = tokenizer.texts_to_sequences(question)
-    answers = tokenizer.texts_to_sequences(answer)
-    supporting_facts = tokenizer.texts_to_sequences(facts)
+    answers = np.asarray(tokenizer.texts_to_sequences(answer))
     if only_supporting:
-        stories = supporting_facts
+        stories = tokenizer.texts_to_sequences(facts)
     return (
         pad_sequences(stories, MAX_STORY_LENGTH),
         pad_sequences(questions, MAX_QUES_LENGTH, padding='post'),
@@ -104,28 +107,12 @@ def get_word_embeddings(word_index):
         return embedding_matrix
 
 
-if __name__ == '__main__':
-    train_files = get_file_list('train')
-    test_files = get_file_list('test')
-    train_context, train_question, train_answer, train_sup_facts = structure_data(train_files[TASK - 1])
-    test_context, test_question, test_answer, test_sup_facts = structure_data(test_files[TASK - 1])
-    tokenizer = Tokenizer(oov_token='<OOV>')
-    tokenizer.fit_on_texts(train_context + train_question)
-    # print(tokenizer.word_index)
-    # extracting max length of story and question from train and test data
-    # instead of keeping it default since test story/question length might be longer
-    MAX_STORY_LENGTH = max(map(len, train_context + test_context))
-    MAX_QUES_LENGTH = max(map(len, train_question + test_question))
-    x_train, q_train, y_train = convert_data(train_context, train_question, train_answer, train_sup_facts,
-                                             only_supporting=True)
-    # print(x_train[0], q_train[0], y_train[0])
-    x_test, q_test, y_test = convert_data(test_context, test_question, test_answer, test_sup_facts,
-                                          only_supporting=True)
-    # print(x_train.shape, q_train.shape, y_train.shape)
-    # print(x_test.shape, q_test.shape, y_test.shape)
+def reconstruct_sentence(seq, mapping):
+    reverse_mapping = {value: key for key, value in mapping.items()}
+    return ' '.join([reverse_mapping.get(s, '?') for s in seq])
 
-    word_embeddings = get_word_embeddings(tokenizer.word_index)
 
+def train_model():
     # story representation model
     story = layers.Input(shape=(MAX_STORY_LENGTH,), dtype='int32')
     story_model = layers.Embedding(
@@ -150,11 +137,54 @@ if __name__ == '__main__':
     combined_repr = layers.concatenate([story_model, question_model])
     probs = layers.Dense(len(tokenizer.word_index) + 1, activation='softmax')(combined_repr)
     combined_model = models.Model([story, question], probs)
-    combined_model.summary()
+    # combined_model.summary()
     combined_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
     print(x_train.shape, q_train.shape, y_train.shape, len(tokenizer.word_index) + 1, MAX_STORY_LENGTH, MAX_QUES_LENGTH)
     combined_model.fit([x_train, q_train], y_train, batch_size=BATCH_SIZE, epochs=EPOCHS, validation_split=0.05)
 
     loss, acc = combined_model.evaluate([x_test, q_test], y_test)
-
     print("Test loss: {}, test accuracy: {}".format(loss, acc))
+
+    return combined_model
+
+
+if __name__ == '__main__':
+    train_files = get_file_list('train')
+    test_files = get_file_list('test')
+    train_context, train_question, train_answer, train_sup_facts = structure_data(train_files[TASK - 1], False)
+    test_context, test_question, test_answer, test_sup_facts = structure_data(test_files[TASK - 1], False)
+    if TASK == 19:
+        # for task 19, the answers only contain letters not words, thus mapping them
+        task19_mapping = {'s': 'south', 'e': 'east', 'w': 'west', 'n': 'north'}
+        for i in range(len(train_answer)):
+            train_answer[i] = list(map(lambda x: task19_mapping.get(x, ','), train_answer[i]))
+        for i in range(len(test_answer)):
+            test_answer[i] = list(map(lambda x: task19_mapping.get(x, ','), test_answer[i]))
+        print(train_answer[0])
+    tokenizer = Tokenizer(oov_token='<OOV>')
+    tokenizer.fit_on_texts(train_context + train_question + train_answer)
+    print(tokenizer.word_index)
+    # extracting max length of story and question from train and test data
+    # instead of keeping it default since test story/question length might be longer
+    MAX_STORY_LENGTH = max(map(len, train_context + test_context))
+    MAX_QUES_LENGTH = max(map(len, train_question + test_question))
+    x_train, q_train, y_train = convert_data(train_context, train_question, train_answer, train_sup_facts,
+                                             only_supporting=False)
+    # print(x_train[0], q_train[0], y_train[0])
+    x_test, q_test, y_test = convert_data(test_context, test_question, test_answer, test_sup_facts,
+                                          only_supporting=False)
+    # print(x_train.shape, q_train.shape, y_train.shape)
+    # print(x_test.shape, q_test.shape, y_test.shape)
+
+    # load glove vectors for to words required and put them in a matrix
+    word_embeddings = get_word_embeddings(tokenizer.word_index)
+
+    model = train_model()
+    prediction = model.predict([x_train, q_train])
+    print("Testing")
+    # print([if for i in range(y_train[0]) > 0)
+    print("Story: {}\nQuestion: {}\nAnswer: {}\nModel Answer: {}".format(
+        reconstruct_sentence(x_train[0], tokenizer.word_index),
+        reconstruct_sentence(q_train[0], tokenizer.word_index),
+        np.argsort(-y_train[0])[:5],
+        np.argsort(-prediction[0])[:5]))
